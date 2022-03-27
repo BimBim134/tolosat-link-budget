@@ -20,6 +20,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
+from scipy import interpolate
+
 # TLE tools import
 from tletools import TLE
 
@@ -33,6 +35,8 @@ from astropy.time import Time
 # just a progress bar
 from tqdm import tqdm
 
+# make the code run FASTER
+from numba import jit
 
 #%% TOLOSAT definition
 now = Time.now()  # get the actual time
@@ -72,14 +76,17 @@ updateIridium(now)  # synchronise every iridium to the current time
 
 
 #%% inter-satellite distance calculation definition
+
+@jit
 def dist_between(a, b):
-    return np.sqrt((a.r[0]-b.r[0])**2 +
-                   (a.r[1]-b.r[1])**2 +
-                   (a.r[2]-b.r[2])**2)
+    return np.sqrt((a[0]-b[0])**2 +
+                   (a[1]-b[1])**2 +
+                   (a[2]-b[2])**2)
 
 
 #%% relative speed to doppler shift converter
 
+@jit
 def vel2doppler_shift(v, f):
     # f = f₀(v + vr)/(v + vs)
     # v : wave speed
@@ -87,7 +94,7 @@ def vel2doppler_shift(v, f):
     # vs : source velocity
 
     f0 = f
-    c = 299792458 * (u.m / u.s)  # speed of light in vacuum
+    c = 299792458  # speed of light in vacuum
     f_shift = (f0 * c)/(c + v)
 
     return f_shift - f0
@@ -95,42 +102,44 @@ def vel2doppler_shift(v, f):
 
 #%% distance to corresponding signal attenuation converter
 
+@jit
 def dist2att(d, f):
     # attenuation (dB) = 20 * log10(d) + 20 * log10(f) + 20 * log10(4π / c)
-    dist = d.to(u.m)
-    freq = f.to(u.Hz)
+    dist = d
+    freq = f
     c = 299792458  # speed of light in vacuum (in m/s)
 
-    loss = 20*np.log10(dist.value) + 20 * \
-        np.log10(freq.value) + 20*np.log10(4*np.pi/c)
+    loss = 20*np.log10(dist) + 20 * \
+        np.log10(freq) + 20*np.log10(4*np.pi/c)
 
-    return -loss * u.dB
+    return -loss
 
 
 #%% function to determine visibility
-
+@jit
 def angleBetween(a, b):
     # array as input (ex : tolosat_orb.r.value and iridium_orb[0].r.value)
     # angle = arccos[(xa * xb + ya * yb + za * zb) / (√(xa2 + ya2 + za2) * √(xb2 + yb2 + zb2))]
     num = a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
-    denum = np.sqrt(a[0]**2 + a[1]**2 + a[2]**2) * np.sqrt(b[0]**2 + b[1]**2 + b[2]**2)
+    denum = np.sqrt(a[0]**2 + a[1]**2 + a[2]**2) * \
+        np.sqrt(b[0]**2 + b[1]**2 + b[2]**2)
 
     return np.arccos(num/denum)
 
-
+@jit
 def theySeeEachOther(a, b, alpha):
     # check if B is behind the horizon from A
     # by calculating the middle point and check if it's above surface
-    mean_point = (a.r + b.r)/2
+    mean_point = (a + b)/2
     alt_mean_point = np.sqrt(
         mean_point[0]**2 + mean_point[1]**2 + mean_point[2]**2)
-    criteria_1 = alt_mean_point > 6371 * u.km  # earth diameter
+    criteria_1 = alt_mean_point > 6371 * 1e3  # earth diameter
 
     # check if B is in a cone under A by checking the angle between
     # the vector from earth to A and
     # the vector from A to B
-    vec_a = a.r.value
-    vec_b = a.r.value - b.r.value
+    vec_a = a
+    vec_b = b - a
     criteria_2 = np.abs(angleBetween(vec_a, vec_b)) < alpha/2
 
     return criteria_1 & criteria_2  # return true if both criteria are true
@@ -138,11 +147,49 @@ def theySeeEachOther(a, b, alpha):
 
 #%% SIMULATION
 
-step = 1 * u.s  # time between each step
-nb_step = 3600  # number of step
+step = 10 * u.minute # time between each step
+nb_step = 6*24*7 # number of step
 time_array = now + step * np.arange(nb_step)  # list of dates
 
-result = np.zeros((len(time_array), len(iridium_orb), 6))
+dt = step.to(u.s).value
+
+nb_sat = len(iridium_orb)
+
+positions = np.zeros((3,nb_step, nb_sat+1))
+
+print("\ncalculating positions...")
+for t in tqdm(range(nb_step)):
+    
+    updateIridium(time_array[t])
+    tolosat_orb = tolosat_orb.propagate(time_array[t])
+    
+    positions[:,t,0] = tolosat_orb.r.to(u.m).value
+    
+    for sat in range(nb_sat):
+        positions[:,t,sat+1] = iridium_orb[sat].r.to(u.m).value
+        
+# interpolation to speed up calculation
+
+subStep = 50
+positions_interp = np.zeros((3,nb_step*subStep,nb_sat+1))
+
+dt_interp = dt/subStep
+
+x = np.arange(nb_step)
+print("\ninterpolating positions...")
+for sat in tqdm(range(nb_sat+1)):
+    y = positions[:, :, sat]
+    f0 = interpolate.interp1d(x, y[0,:], 'cubic')
+    f1 = interpolate.interp1d(x, y[1,:], 'cubic')
+    f2 = interpolate.interp1d(x, y[2,:], 'cubic')
+    
+    x_new = np.linspace(0, x[-1], len(x)*subStep)
+    positions_interp[0, :, sat] = f0(x_new)
+    positions_interp[1, :, sat] = f1(x_new)
+    positions_interp[2, :, sat] = f2(x_new)
+    
+
+result = np.zeros((nb_step*subStep, nb_sat, 6))
 # result description
 # [time, satellite, :]
 # categories
@@ -152,100 +199,66 @@ result = np.zeros((len(time_array), len(iridium_orb), 6))
 # [:,:,4] = doppler shift rate (Hz/s)
 # [:,:,5] = reachable (y/n)
 
-
-print("calculating distance and attenuation...")
-for t in tqdm(range(len(time_array))):
-    updateIridium(time_array[t])
-    tolosat_orb.propagate(time_array[t])
-
-    for sat in range(len(iridium_orb)):
-        dist = dist_between(tolosat_orb, iridium_orb[sat])
-        result[t, sat, 0] = dist.to(u.m).value
-        result[t, sat, 1] = dist2att(dist,  1.62125 * u.GHz).value
-
+print("\ncalculating distance and attenuation...")
+for t in tqdm(range(nb_step*subStep)):
+    for sat in range(nb_sat):
+        dist = dist_between(positions_interp[:,t,0], positions_interp[:,t,sat+1])
+        result[t, sat, 0] = dist
+        result[t, sat, 1] = dist2att(dist,  1.62125 * 1e9)
+        
 # the following derivations are done using finite difference method :
 # https://www.wikiwand.com/en/Finite_difference_coefficient
 
-dt = step.to(u.s).value
-
-print("\n calculating relative velocities and doppler shift...")
-for t in tqdm(np.arange(1, nb_step-1)):
+print("\ncalculating relative velocities and doppler shift...")
+for t in tqdm(np.arange(1, (nb_step*subStep)-1)):
     for sat in range(len(iridium_orb)):
-        result[t, sat, 2] = 0.5*(result[t+1, sat, 0] - result[t-1, sat, 0])/dt
+        # the idea is to derivate the distance between tolosat and the other satellite
+        # to get the relative velocity, then convert this velocity to doppler shift
+        result[t, sat, 2] = 0.5*(result[t+1, sat, 0] - result[t-1, sat, 0])/dt_interp
         result[t, sat, 3] = vel2doppler_shift(
-            result[t, sat, 2] * (u.m / u.s),  1.62125 * u.GHz).to(u.Hz).value
+            result[t, sat, 2], 1.62125 * 1e9)
 
-for sat in range(len(iridium_orb)):
-    result[0, sat, 2] = (result[1, sat, 0] - result[0, sat, 0])/dt
+for sat in range(nb_sat):
+    result[0, sat, 2] = (result[1, sat, 0] - result[0, sat, 0])/dt_interp
     result[0, sat, 3] = vel2doppler_shift(
-        result[0, sat, 2] * (u.m / u.s),  1.62125 * u.GHz).to(u.Hz).value
+        result[0, sat, 2], 1.62125 * 1e9)
 
-for sat in range(len(iridium_orb)):
-    result[-1, sat, 2] = (result[-1, sat, 0] - result[-2, sat, 0])/dt
+for sat in range(nb_sat):
+    result[-1, sat, 2] = (result[-1, sat, 0] - result[-2, sat, 0])/dt_interp
     result[-1, sat, 3] = vel2doppler_shift(
-        result[-1, sat, 2] * (u.m / u.s),  1.62125 * u.GHz).to(u.Hz).value
+        result[-1, sat, 2], 1.62125 * 1e9)
 
-print("\n calculating doppler shift rate...")
-for t in np.arange(1, nb_step-1):
+
+print("\ncalculating doppler shift rate...")
+for t in tqdm(np.arange(1, (nb_step*subStep)-1)):
     for sat in range(len(iridium_orb)):
-        result[t, sat, 4] = 0.5*(result[t+1, sat, 3] - result[t-1, sat, 3])/dt
+        result[t, sat, 4] = 0.5*(result[t+1, sat, 3] - result[t-1, sat, 3])/dt_interp
 
-for sat in range(len(iridium_orb)):
-    result[0, sat, 4] = (result[1, sat, 3] - result[0, sat, 3])/dt
+for sat in range(nb_sat):
+    result[0, sat, 4] = (result[1, sat, 3] - result[0, sat, 3])/dt_interp
 
-for sat in range(len(iridium_orb)):
-    result[-1, sat, 4] = (result[-1, sat, 3] - result[-2, sat, 3])/dt
+for sat in range(nb_sat):
+    result[-1, sat, 4] = (result[-1, sat, 3] - result[-2, sat, 3])/dt_interp
+
 
 # the following calculation check if all the connectivity criteria are met
-print("\n determine the reachability...")
-for t in tqdm(range(len(time_array))):
-    for sat in range(len(iridium_orb)):
+print("\ndetermine the reachability...")
+for t in tqdm(range((nb_step*subStep))):
+    for sat in range(nb_sat):
         result[t, sat, 5] = int((np.abs(result[t, sat, 3]) < 37500) &
                                 (np.abs(result[t, sat, 4]) < 345) &
-                                theySeeEachOther(iridium_orb[sat], tolosat_orb, np.radians(120)))
+                                theySeeEachOther(positions_interp[:,t,0], positions_interp[:,t,sat+1], np.radians(120)))
 
-nb_sat_reachable = np.zeros(nb_step)
-for t in range(len(time_array)):
+nb_sat_reachable = np.zeros((nb_step*subStep))
+for t in range((nb_step*subStep)):
     nb_sat_reachable[t] = np.sum(result[t, :, 5])
-
-#%% PLOT every satellite data
-
-
-def plot_Sat_stat(sat):
-
-    plt.subplot(411)
-    plt.title(iridium_TLE[sat].name)
-    plt.plot(np.arange(nb_step)*dt/3600, result[:, sat, 0])
-    plt.ylabel('distance (m)')
-    plt.grid()
-
-    plt.subplot(412)
-    plt.plot(np.arange(nb_step)*dt/3600, result[:, sat, 1])
-    plt.ylabel('attenuation loss (dB)')
-    plt.grid()
-
-    plt.subplot(413)
-    plt.plot(np.arange(nb_step)*dt/3600, result[:, sat, 3])
-    plt.ylabel('doppler shift (Hz)')
-    plt.grid()
-
-    plt.subplot(414)
-    plt.plot(np.arange(nb_step)*dt/3600, result[:, sat, 4])
-    plt.ylabel('doppler shift rate (Hz/s)')
-    plt.xlabel('time (h)')
-    plt.grid()
-
-
-plt.figure()
-for i in range(len(iridium_orb)):
-    plt.clf()
-    plot_Sat_stat(i)
-    plt.pause(0.05)
 
 #%% PLT the number of reachable satellite
 
 plt.figure()
-plt.plot(np.arange(nb_step)*dt/3600, nb_sat_reachable)
+plt.plot(np.arange(nb_step*subStep)*dt_interp/3600, nb_sat_reachable)
 plt.ylabel('number of satellite reachable')
 plt.xlabel('time (h)')
+plt.title('coverage : ' + str(int(100*np.mean(nb_sat_reachable))) + '%')
 plt.grid()
+
